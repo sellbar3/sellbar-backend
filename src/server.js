@@ -1,0 +1,115 @@
+const path = require("path");
+require("dotenv").config({ path: path.resolve(__dirname, "../.env") });
+require("dotenv").config();
+
+const app = require("./app");
+const connectDB = require("./config/db");
+const User = require("./models/User");
+const bcrypt = require("bcryptjs");
+const mongoose = require("mongoose");
+
+const logger = require("./utils/logger");
+
+async function bootstrapAdmin() {
+  const email = process.env.ADMIN_EMAIL;
+  const password = process.env.ADMIN_PASSWORD;
+
+  if (!email || !password) {
+    logger.info(
+      "Admin creation skipped: ADMIN_EMAIL or ADMIN_PASSWORD missing",
+    );
+    return;
+  }
+
+  if (password.length < 6) {
+    throw new Error("ADMIN_PASSWORD must be at least 6 characters");
+  }
+
+  const normalizedEmail = email.toLowerCase().trim();
+
+  const existingAdmin = await User.findOne({
+    $or: [{ email: normalizedEmail }, { role: "admin" }],
+  });
+
+  const rounds = Math.max(
+    10,
+    Math.min(14, Number(process.env.BCRYPT_ROUNDS) || 12),
+  );
+
+  const hashedPassword = await bcrypt.hash(password, rounds);
+
+  if (existingAdmin) {
+    existingAdmin.name = process.env.ADMIN_NAME || existingAdmin.name || "Sellbar Admin";
+    existingAdmin.email = normalizedEmail;
+    existingAdmin.password = hashedPassword;
+    existingAdmin.role = "admin";
+    existingAdmin.status = "active";
+    await existingAdmin.save();
+    logger.info(`Admin account synchronized with .env: ${existingAdmin.email}`);
+    return;
+  }
+
+  const admin = await User.create({
+    name: process.env.ADMIN_NAME || "Sellbar Admin",
+    email: normalizedEmail,
+    password: hashedPassword,
+    role: "admin",
+    status: "active",
+  });
+
+  logger.info(`Initial admin created: ${admin.email}`);
+}
+
+async function startServer() {
+  const port = Number(process.env.PORT) || 5000;
+
+  try {
+    await connectDB();
+    await bootstrapAdmin();
+  } catch (dbErr) {
+    logger.error("MongoDB not yet connected (" + (dbErr.message || dbErr) + ").");
+    logger.info("SELLBAR backend server starting; database retry will continue in background.");
+
+    let retrying = false;
+    const retryInterval = setInterval(async () => {
+      if (retrying || mongoose.connection.readyState === 1) return;
+      retrying = true;
+      try {
+        await connectDB();
+        await bootstrapAdmin();
+        clearInterval(retryInterval);
+      } catch {
+        // Will retry on next tick
+      } finally {
+        retrying = false;
+      }
+    }, 10000);
+  }
+
+  const server = app.listen(port, "0.0.0.0", () => {
+    logger.info(`SELLBAR API running on port ${port} (0.0.0.0)`);
+    logger.info(`Gateway: ${process.env.API_URL || "https://app.sellbar.in/api"} | Client: ${process.env.CLIENT_URL || "https://sellbar.in"}`);
+  });
+
+  async function shutdown(signal) {
+    logger.info(`${signal} received. Closing server...`);
+
+    server.close(async () => {
+      try {
+        await mongoose.disconnect();
+        process.exit(0);
+      } catch (error) {
+        logger.error("Shutdown error", error);
+        process.exit(1);
+      }
+    });
+  }
+
+  process.on("SIGTERM", () => shutdown("SIGTERM"));
+  process.on("SIGINT", () => shutdown("SIGINT"));
+}
+
+startServer().catch((error) => {
+  logger.error("Server startup failed:", error);
+  process.exit(1);
+});
